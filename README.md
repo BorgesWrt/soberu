@@ -1,100 +1,83 @@
-# vinext-starter
+# Soberu
 
-A clean full-stack starter running on
-[vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
-Drizzle support.
+MVP сервиса планирования встреч в Москве и Санкт-Петербурге. Проект не требует
+учётной записи ChatGPT. Production-версия работает на Cloudflare Workers:
+[soberu.soberu-app.workers.dev](https://soberu.soberu-app.workers.dev).
 
-## Prerequisites
+## Запуск
 
-- Node.js `>=22.13.0`
+Нужен Node.js 22 или новее.
 
-## Quick Start
-
-```bash
+```powershell
 npm install
 npm run dev
-npm run build
 ```
 
-This starter does not use `wrangler.jsonc`.
+После запуска откройте адрес, который появится в терминале — обычно
+`http://localhost:3000`.
 
-## Included Shape
+## Локальные данные
 
-- edit site code under `app/`
-- `.openai/hosting.json` declares optional Sites D1 and R2 bindings
-- `vite.config.ts` simulates declared bindings for local development
-- `db/schema.ts` starts intentionally empty
-- `examples/d1/` contains an optional D1 example surface
-- `drizzle.config.ts` supports local migration generation when needed
+- Черновик автоматически восстанавливается из `localStorage` браузера.
+- Готовые встречи сохраняются и в `localStorage`, и через `/api/meetings` в
+  локальную SQLite/D1-базу внутри `.wrangler`.
+- Чтобы создать или обновить таблицы после изменения схемы:
 
-## Workspace Auth Headers
-
-Signed-in visitors receive both `oai-authenticated-user-id` and `oai-authenticated-user-email`. Private Sites require every visitor to sign in; public Sites may also have anonymous visitors, for whom neither header is present.
-
-The user ID is stable for the same user on the same Site and different across Sites. Email and name are intended for display or contact purposes.
-
-SIWC-authenticated workspace sites may also receive
-`oai-authenticated-user-full-name` when the user's SIWC profile has a non-empty
-`name` claim. The full-name value is percent-encoded UTF-8 and is accompanied by
-`oai-authenticated-user-full-name-encoding: percent-encoded-utf-8`.
-
-Treat the full name as optional and fall back to email when it is absent:
-
-```tsx
-import { headers } from "next/headers";
-
-export default async function Home() {
-  const requestHeaders = await headers();
-  const userId = requestHeaders.get("oai-authenticated-user-id");
-  const email = requestHeaders.get("oai-authenticated-user-email");
-  const encodedFullName = requestHeaders.get("oai-authenticated-user-full-name");
-  const fullName =
-    encodedFullName &&
-    requestHeaders.get("oai-authenticated-user-full-name-encoding") ===
-      "percent-encoded-utf-8"
-      ? decodeURIComponent(encodedFullName)
-      : null;
-
-  const displayName = fullName ?? email;
-  // ...
-}
+```powershell
+npm run db:migrate:local
 ```
 
-## Optional Dispatch-Owned ChatGPT Sign-In
+Локальная база изолирована от production D1 и не меняет опубликованные встречи.
 
-Import the ready-to-use helpers from `app/chatgpt-auth.ts` when the site needs
-optional or required ChatGPT sign-in:
+## Production
 
-- Use `getChatGPTUser()` for optional signed-in UI.
-- Use `requireChatGPTUser(returnTo)` for server-rendered pages that should send
-  anonymous visitors through Sign in with ChatGPT.
-- Use `chatGPTSignInPath(returnTo)` and `chatGPTSignOutPath(returnTo)` for
-  browser links or actions.
-- Pass a same-origin relative `returnTo` path for the destination after sign-in
-  or sign-out. The helper validates and safely encodes it.
-- Mark protected pages with `export const dynamic = "force-dynamic"` because
-  they depend on per-request identity headers.
+Перед первым деплоем авторизуйтесь в Cloudflare и примените миграции:
 
-Dispatch owns `/signin-with-chatgpt`, `/signout-with-chatgpt`, `/callback`, the
-OAuth cookies, and identity header injection. Do not implement app routes for
-those reserved paths. Routes that do not import and call the helper remain
-anonymous-compatible.
+```powershell
+npm exec wrangler login
+npm run db:migrate:production
+npm run deploy
+```
 
-SIWC establishes identity only; it does not prove workspace membership. Use the
-Sites hosting platform's access policy controls for workspace-wide restrictions,
-or enforce explicit server-side membership or allowlist checks.
+Конфигурация production находится в `wrangler.jsonc`, локальная конфигурация —
+в `wrangler.local.jsonc`. При обычном `npm run dev` всегда используется только
+локальная D1.
 
-Use SIWC for account pages, user-specific dashboards, saved records, and write
-actions tied to the current ChatGPT user. Leave public content anonymous.
+Каталог KudaGo синхронизируется защищённым endpoint `/api/catalog/sync`.
+Production-токен хранится в секретах Cloudflare и не добавляется в Git.
 
-## Useful Commands
+## Карта и маршруты
 
-- `npm run dev`: start local development
-- `npm run build`: verify the vinext build output
-- `npm test`: build the starter and verify its rendered loading skeleton
-- `npm run db:generate`: generate Drizzle migrations after schema changes
+- Тёмную интерактивную карту рисует MapLibre GL, подложка — OpenStreetMap.
+- На этапе выбора района маршрут не строится: показываются только «Место встречи»
+  и открытый справочник городских ориентиров.
+- Поиск адресов, метро, районов и достопримечательностей идёт через локальный
+  `/api/places/search`, который обращается к Photon с жёстким ограничением
+  результатов границами выбранного города. Выбранную точку нужно явно подтвердить.
+- Точку встречи также можно поставить кликом по карте; адрес уточняется обратным
+  геокодированием Photon.
+- PNG-карточка маршрута загружает нужные тайлы через `/api/map/tile` и рисует
+  тёмную карту выбранного города, место встречи и остановки прямо на canvas.
+- В готовой программе строится один пеший маршрут от места встречи по всем
+  остановкам. Адреса участников приложение не запрашивает и не хранит.
+- Без ключей приложение работает со схематичной линией маршрута. Для маршрута
+  по пешеходной сети скопируйте `.env.example` в `.env.local` и добавьте
+  бесплатный `OPENROUTESERVICE_API_KEY`.
 
-## Learn More
+Названия, адреса и координаты справочника лежат в `app/data/places.ts`; для
+каждого места указана ссылка на открытый источник данных.
 
-- [vinext Documentation](https://github.com/cloudflare/vinext)
-- [Drizzle D1 Guide](https://orm.drizzle.team/docs/get-started/d1-new)
+## Перенос на другой компьютер
+
+Скопируйте папку проекта целиком, но папку `node_modules` можно не переносить:
+она большая и восстанавливается командой `npm install`.
+
+На новом компьютере:
+
+1. Установите Node.js 22 или новее.
+2. Откройте терминал в папке проекта.
+3. Выполните `npm install`.
+4. Выполните `npm run dev`.
+
+Исходный код интерфейса находится в `app/page.tsx`, стили — в
+`app/globals.css`, изображения — в `public`.

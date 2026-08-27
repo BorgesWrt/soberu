@@ -1,5 +1,5 @@
 {
-  "name": "site-creator-vinext-starter",
+  "name": "soberu",
   "version": "0.1.0",
   "private": true,
   "engines": {
@@ -10,11 +10,18 @@
     "build": "vinext build",
     "start": "vinext start",
     "test": "npm run build && node --test tests/rendered-html.test.mjs",
-    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
-    "db:generate": "drizzle-kit generate"
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern worker-configuration.d.ts",
+    "cf:types": "wrangler types --config wrangler.local.jsonc",
+    "typecheck": "tsc --noEmit",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate:local": "wrangler d1 migrations apply soberu-local --local --config wrangler.local.jsonc",
+    "db:migrate:production": "wrangler d1 migrations apply soberu-production --remote --config wrangler.jsonc",
+    "deploy": "vinext-cloudflare deploy",
+    "catalog:sync:local": "node scripts/sync-catalog.mjs"
   },
   "dependencies": {
     "drizzle-orm": "0.45.2",
+    "maplibre-gl": "^6.5.0",
     "react": "19.2.6",
     "react-dom": "19.2.6"
   },
@@ -22,11 +29,11 @@
     "@cloudflare/vite-plugin": "1.37.1",
     "@eslint/js": "9.39.4",
     "@next/eslint-plugin-next": "16.2.6",
-    "@openai/sites-vite-plugin": "0.1.0",
     "@tailwindcss/postcss": "4.2.1",
     "@types/node": "22.19.19",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
+    "@vinext/cloudflare": "^1.0.0-beta.2",
     "@vitejs/plugin-react": "6.0.2",
     "@vitejs/plugin-rsc": "0.5.26",
     "drizzle-kit": "0.31.10",

@@ -1,0 +1,16 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "soberu",
+  "main": "./worker/index.ts",
+  "account_id": "e02c5b7beb5da3613a6f8ff75ba108ef",
+  "compatibility_date": "2026-05-22",
+  "compatibility_flags": ["nodejs_compat"],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "soberu-production",
+      "database_id": "6665045a-673b-475b-a22e-aea095106c93",
+      "migrations_dir": "drizzle"
+    }
+  ]
+}

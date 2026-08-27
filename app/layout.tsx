@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Manrope, Playfair_Display } from "next/font/google";
 import { headers } from "next/headers";
+import "maplibre-gl/dist/maplibre-gl.css";
 import "./globals.css";
 
 const manrope = Manrope({ variable: "--font-sans", subsets: ["cyrillic", "latin"] });
@@ -15,8 +16,8 @@ export async function generateMetadata(): Promise<Metadata> {
   const host = requestHeaders.get("x-forwarded-host") ?? requestHeaders.get("host") ?? "localhost:3000";
   const protocol = requestHeaders.get("x-forwarded-proto") ?? (host.startsWith("localhost") ? "http" : "https");
   const origin = `${protocol}://${host}`;
-  const title = "Соберёмся — планировщик встреч в Петербурге";
-  const description = "Найдите общее время и получите три готовых плана встречи для всей компании.";
+  const title = "Soberu — собраться стало проще";
+  const description = "Общее время, общие желания и три готовых плана встречи для вашей компании.";
 
   return {
     metadataBase: new URL(origin),
