@@ -3,10 +3,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import SoberuMap from "./components/SoberuMap";
 import { cityConfigs, type CityId, type CityPlace } from "./data/places";
+import { addContact, createDefaultMemory, MEMORY_STORAGE_KEY, preferenceBoost, readMemory, updateWeights, type PlaceReaction, type SoberuMemory } from "./lib/soberu-memory";
 
 type Mode = "builder" | "room" | "plans" | "final";
 type VenueAlternative = { name: string; distance: string; website: string; address?: string; coords?: [number, number]; note?: string };
-type VenueStop = { id: string; time: string; name: string; address: string; coords: [number, number]; website: string; note: string; analogs: VenueAlternative[] };
+type VenueStop = { id: string; time: string; name: string; address: string; coords: [number, number]; website: string; note: string; analogs: VenueAlternative[]; tags?: string[] };
 type LocationCandidate = { id: string; label: string; address: string; coords: [number, number]; kind: string; source: string; website?: string; description?: string };
 type MeetingLocation = { label: string; address?: string; coords: [number, number]; kind?: string; source?: string };
 type SaveState = "idle" | "saving" | "saved" | "local";
@@ -108,10 +109,10 @@ function getLongestWindow(availability: Record<string, number[]>) {
   return result;
 }
 
-function makeParticipants(total: number): Participant[] {
+function makeParticipants(total: number, contactNames: string[] = []): Participant[] {
   return [
     { id: "host", name: "Вы", role: "host", status: "ready", votedAt: new Date().toISOString() },
-    ...Array.from({ length: Math.max(1, total) - 1 }, (_, index) => ({ id: `slot-${index + 1}`, name: `Гость ${index + 1}`, role: "guest" as const, status: "waiting" as const })),
+    ...Array.from({ length: Math.max(1, total) - 1 }, (_, index) => ({ id: `slot-${index + 1}`, name: contactNames[index] || `Гость ${index + 1}`, role: "guest" as const, status: "waiting" as const })),
   ];
 }
 
@@ -263,6 +264,10 @@ function normalizeSearch(value: string) {
   return value.toLowerCase().replace(/ё/g, "е").replace(/[^a-zа-я0-9]+/gi, " ").trim();
 }
 
+function stopMemoryId(stop: Pick<VenueStop, "name" | "coords">) {
+  return `${normalizeSearch(stop.name)}:${stop.coords.map((value) => value.toFixed(4)).join(":")}`;
+}
+
 function placeToCandidate(place: CityPlace): LocationCandidate {
   return { id: place.id, label: place.name, address: place.address, coords: place.coords, kind: place.categories[0] || "Место", source: place.source, website: place.website, description: place.description };
 }
@@ -376,6 +381,18 @@ export default function Home() {
   const [guestStage, setGuestStage] = useState<"idle" | "name" | "vote" | "done">("idle");
   const [guestError, setGuestError] = useState("");
   const [stopAlternativeSelections, setStopAlternativeSelections] = useState<Record<string, number>>({});
+  const [memory, setMemory] = useState<SoberuMemory>(createDefaultMemory);
+  const [memoryReady, setMemoryReady] = useState(false);
+  const [memoryOpen, setMemoryOpen] = useState(false);
+  const [selectedContactIds, setSelectedContactIds] = useState<string[]>([]);
+  const [newContactName, setNewContactName] = useState("");
+  const [routeLayouts, setRouteLayouts] = useState<Record<string, VenueStop[]>>({});
+  const [rebuildIntent, setRebuildIntent] = useState<"compact" | "budget" | "food" | "novelty" | "calm" | "">("");
+  const [feedbackRating, setFeedbackRating] = useState(0);
+  const [feedbackPositives, setFeedbackPositives] = useState<string[]>([]);
+  const [feedbackIssues, setFeedbackIssues] = useState<string[]>([]);
+  const [placeReactions, setPlaceReactions] = useState<Record<string, PlaceReaction>>({});
+  const [feedbackSaved, setFeedbackSaved] = useState(false);
   const hourDragRef = useRef({ active: false, selecting: true, lastKey: "" });
 
   const activeCity = cityConfigs[city];
@@ -390,7 +407,8 @@ export default function Home() {
   const budgetProgress = ((budgetLimit - 500) / (10000 - 500)) * 100;
   const peopleProgress = ((size - 2) / (20 - 2)) * 100;
   const selectedHoursCount = Object.values(availability).reduce((total, hours) => total + hours.length, 0);
-  const roomParticipants = participants.length ? participants : makeParticipants(size);
+  const selectedContacts = memory.contacts.filter((contact) => selectedContactIds.includes(contact.id));
+  const roomParticipants = participants.length ? participants : makeParticipants(size, selectedContacts.map((contact) => contact.name));
   const votedCount = roomParticipants.filter((participant) => participant.status === "ready").length;
   const effectiveBudgetLimit = Math.min(budgetLimit, ...roomParticipants.filter((participant) => participant.status === "ready" && participant.budgetLimit).map((participant) => participant.budgetLimit!), budgetLimit);
   const combinedPrefs = useMemo(() => Array.from(new Set([
@@ -448,7 +466,13 @@ export default function Home() {
             const goalScore = [...goalCategories, ...companyCategories].filter((category) => categories.includes(category)).length * 10;
             const slotScore = slot.filter((category) => categories.includes(category)).length * 16;
             const leg = distanceKm(cursor, item.coords);
-            return preferenceScore + goalScore + slotScore + (item.type === "event" ? 5 : 0) - item.distanceKm * 8 - leg * 18 - pricePenalty(item);
+            const personalScore = preferenceBoost(memory.preferenceWeights, categories) * 20;
+            const favoriteScore = memory.favoritePlaces.some((place) => normalizeSearch(place.name) === normalizeSearch(item.name)) ? 24 : 0;
+            const visitedPenalty = memory.visitedPlaceIds.some((id) => id.includes(item.id) || id.includes(normalizeSearch(item.name))) ? (goal === "surprise" || rebuildIntent === "novelty" ? 36 : 7) : 0;
+            const compactBonus = rebuildIntent === "compact" || rebuildIntent === "calm" ? -leg * 16 : 0;
+            const foodBonus = rebuildIntent === "food" && categories.some((category) => ["restaurants", "cafe", "bars"].includes(category)) ? 24 : 0;
+            const budgetBonus = rebuildIntent === "budget" && (item.isFree || !item.price) ? 18 : 0;
+            return preferenceScore + goalScore + slotScore + personalScore + favoriteScore + foodBonus + budgetBonus + compactBonus + (item.type === "event" ? 5 : 0) - item.distanceKm * 8 - leg * 18 - pricePenalty(item) - visitedPenalty;
           };
           return score(second) - score(first);
         });
@@ -480,11 +504,11 @@ export default function Home() {
       result[plan.id] = picked.map((item, index) => {
         const analogs = catalogItems.filter((candidate) => candidate.type === "place" && catalogPlaceKey(candidate) !== catalogPlaceKey(item) && distanceKm(item.coords, candidate.coords) <= 2).sort((a, b) => distanceKm(item.coords, a.coords) - distanceKm(item.coords, b.coords)).slice(0, 2);
         const eventTime = item.startsAt ? new Intl.DateTimeFormat("ru-RU", { hour: "2-digit", minute: "2-digit", timeZone: "Europe/Moscow" }).format(new Date(item.startsAt * 1000)) : null;
-        return { id: `${plan.id}:${item.id}`, time: eventTime || schedule[index] || schedule.at(-1)!, name: item.name, address: [item.place, item.address].filter(Boolean).join(" · ") || activeCity.name, coords: item.coords, website: item.website || "https://kudago.com/", note: item.type === "event" ? `${item.price || (item.isFree ? "Бесплатно" : "Актуальное событие")} · KudaGo` : item.description?.slice(0, 80) || "Место из городского каталога", analogs: analogs.map((analog) => ({ name: analog.name, distance: `${distanceKm(item.coords, analog.coords).toFixed(1)} км`, website: analog.website || "https://kudago.com/", address: [analog.place, analog.address].filter(Boolean).join(" · ") || activeCity.name, coords: analog.coords, note: analog.description?.slice(0, 80) || "Похожее место рядом" })) } satisfies VenueStop;
+        return { id: `${plan.id}:${item.id}`, time: eventTime || schedule[index] || schedule.at(-1)!, name: item.name, address: [item.place, item.address].filter(Boolean).join(" · ") || activeCity.name, coords: item.coords, website: item.website || "https://kudago.com/", note: item.type === "event" ? `${item.price || (item.isFree ? "Бесплатно" : "Актуальное событие")} · KudaGo` : item.description?.slice(0, 80) || "Место из городского каталога", tags: item.categories, analogs: analogs.map((analog) => ({ name: analog.name, distance: `${distanceKm(item.coords, analog.coords).toFixed(1)} км`, website: analog.website || "https://kudago.com/", address: [analog.place, analog.address].filter(Boolean).join(" · ") || activeCity.name, coords: analog.coords, note: analog.description?.slice(0, 80) || "Похожее место рядом" })) } satisfies VenueStop;
       });
     });
     return result;
-  }, [activeCity.name, catalogItems, hasDayProgram, combinedPrefs, goal, company, availability, budgetUnlimited, effectiveBudgetLimit, availablePlans, meetingCenter.coords]);
+  }, [activeCity.name, catalogItems, hasDayProgram, combinedPrefs, goal, company, availability, budgetUnlimited, effectiveBudgetLimit, availablePlans, meetingCenter.coords, memory.favoritePlaces, memory.preferenceWeights, memory.visitedPlaceIds, rebuildIntent]);
   const localFallbackStops = useMemo(() => {
     const schedule = hasDayProgram ? ["11:30", "14:00", "17:00", "20:00"] : ["18:30", "20:00", "21:30"];
     const routeSize = hasDayProgram ? 4 : 3;
@@ -499,6 +523,7 @@ export default function Home() {
       coords: place.coords,
       website: place.website,
       note: place.description,
+      tags: place.categories,
       analogs: cityPlaces.filter((candidate) => candidate.id !== place.id).map((candidate) => ({ candidate, distance: distanceKm(place.coords, candidate.coords) })).sort((a, b) => a.distance - b.distance).slice(0, 2).map(({ candidate, distance }) => ({ name: candidate.name, distance: `${distance.toFixed(1)} км`, website: candidate.website, address: candidate.address, coords: candidate.coords, note: candidate.description })),
     } satisfies VenueStop);
 
@@ -519,8 +544,9 @@ export default function Home() {
             .map((place) => ({ place, leg: distanceKm(cursor, place.coords), start: distanceKm(meetingCenter.coords, place.coords) }))
             .filter((item) => item.leg <= (index === 0 ? startLimit : legLimit) && travelled + item.leg <= totalLimit)
             .sort((first, second) => {
-              const preference = (item: typeof first) => combinedPrefs.filter((pref) => item.place.categories.some((category) => normalizeSearch(category).includes(normalizeSearch(pref)) || normalizeSearch(pref).includes(normalizeSearch(category)))).length * 1.4;
-              return (preference(second) - second.leg * 2.2 - second.start * .35) - (preference(first) - first.leg * 2.2 - first.start * .35);
+              const preference = (item: typeof first) => combinedPrefs.filter((pref) => item.place.categories.some((category) => normalizeSearch(category).includes(normalizeSearch(pref)) || normalizeSearch(pref).includes(normalizeSearch(category)))).length * 1.4 + preferenceBoost(memory.preferenceWeights, item.place.categories) + (memory.favoritePlaces.some((place) => normalizeSearch(place.name) === normalizeSearch(item.place.name)) ? 1.2 : 0);
+              const intent = (item: typeof first) => rebuildIntent === "food" && item.place.categories.some((category) => /еда|кофе|бар|ресторан/i.test(category)) ? 1.4 : rebuildIntent === "compact" || rebuildIntent === "calm" ? -item.leg * 1.3 : 0;
+              return (preference(second) + intent(second) - second.leg * 2.2 - second.start * .35) - (preference(first) + intent(first) - first.leg * 2.2 - first.start * .35);
             });
           const next = selectFrom(false)[0] ?? selectFrom(true)[0] ?? cityPlaces
             .filter((place) => !used.has(place.id))
@@ -546,18 +572,19 @@ export default function Home() {
       const stops = picked.map((place, index) => buildStop(place, plan.id, index));
       return [plan.id, orderStopsFrom(meetingCenter.coords, stops)];
     }));
-  }, [availablePlans, city, cityPlaces, combinedPrefs, hasDayProgram, meetingCenter.coords]);
+  }, [availablePlans, city, cityPlaces, combinedPrefs, hasDayProgram, meetingCenter.coords, memory.favoritePlaces, memory.preferenceWeights, rebuildIntent]);
   const resolvedStopsByPlan = useMemo(() => Object.fromEntries(availablePlans.map((plan) => {
     const catalogRoute = stopsByPlan[plan.id];
     return [plan.id, catalogRoute?.length >= 3 ? catalogRoute : localFallbackStops[plan.id]];
   })), [availablePlans, localFallbackStops, stopsByPlan]);
   const finalStops = useMemo(() => resolvedStopsByPlan[selectedPlan] ?? localFallbackStops[selectedPlan] ?? [], [localFallbackStops, resolvedStopsByPlan, selectedPlan]);
-  const displayStops = useMemo(() => finalStops.map((stop) => {
+  const editableStops = routeLayouts[selectedPlan] ?? finalStops;
+  const displayStops = useMemo(() => editableStops.map((stop) => {
     const selection = stopAlternativeSelections[`${selectedPlan}:${stop.id}`] ?? 0;
     const alternative = selection > 0 ? stop.analogs[selection - 1] : null;
     if (!alternative?.coords) return stop;
     return { ...stop, name: alternative.name, address: alternative.address || stop.address, coords: alternative.coords, website: alternative.website, note: alternative.note || `Альтернатива рядом · ${alternative.distance}` };
-  }), [finalStops, selectedPlan, stopAlternativeSelections]);
+  }), [editableStops, selectedPlan, stopAlternativeSelections]);
   const planDistances = useMemo(() => Object.fromEntries(availablePlans.map((plan) => {
     const stops = resolvedStopsByPlan[plan.id] ?? [];
     let cursor = meetingCenter.coords; let total = 0;
@@ -566,6 +593,17 @@ export default function Home() {
   })), [availablePlans, resolvedStopsByPlan, meetingCenter.coords]);
   const planTitle = useCallback((plan: (typeof availablePlans)[number]) => livePlanTitles[plan.id]?.[hasDayProgram ? "day" : "evening"] || plan.title, [hasDayProgram]);
   const currentPlanTitle = planTitle(currentPlan);
+  const routeReasons = useMemo(() => {
+    const reasons = [`${planDistances[currentPlan.id].toFixed(1)} км от старта по всей программе`];
+    if (combinedPrefs.length) reasons.push(`учтены желания: ${combinedPrefs.slice(0, 2).join(", ")}`);
+    if (memory.favoritePlaces.some((favorite) => displayStops.some((stop) => normalizeSearch(stop.name) === normalizeSearch(favorite.name)))) reasons.push("в маршруте есть ваше избранное");
+    if (!budgetUnlimited) reasons.push(`укладывается в ориентир ${budgetLimit.toLocaleString("ru-RU")} ₽`);
+    if (selectedContacts.length) reasons.push(`приглашены контакты: ${selectedContacts.map((contact) => contact.name).join(", ")}`);
+    return reasons.slice(0, 4);
+  }, [budgetLimit, budgetUnlimited, combinedPrefs, currentPlan.id, displayStops, memory.favoritePlaces, planDistances, selectedContacts]);
+  const currentRouteMemoryId = `${selectedPlan}:${displayStops.map(stopMemoryId).join("|")}`;
+  const currentRouteSaved = memory.savedRoutes.some((route) => route.id === currentRouteMemoryId);
+  const currentMeetingSaved = memory.savedMeetings.some((meeting) => meeting.id === (meetingId || `draft:${normalizeSearch(meetingName)}`));
   const districtPlaces = useMemo(() => (district === "Неважно" ? cityPlaces : cityPlaces.filter((place) => place.district === district)).slice(0, 10).map(placeToCandidate), [cityPlaces, district]);
   const localPlaceResults = useMemo(() => {
     const query = normalizeSearch(placeQuery);
@@ -592,6 +630,19 @@ export default function Home() {
     return { min: toIsoDate(min), max: toIsoDate(max) };
   }, []);
   const firstMeetingDate = selectedDates[0] ?? dateLimits.min;
+
+  useEffect(() => {
+    const restoreMemory = window.setTimeout(() => {
+      setMemory(readMemory(window.localStorage.getItem(MEMORY_STORAGE_KEY)));
+      setMemoryReady(true);
+    }, 0);
+    return () => window.clearTimeout(restoreMemory);
+  }, []);
+
+  useEffect(() => {
+    if (!memoryReady) return;
+    window.localStorage.setItem(MEMORY_STORAGE_KEY, JSON.stringify(memory));
+  }, [memory, memoryReady]);
 
   useEffect(() => {
     const restoreDraft = window.setTimeout(() => {
@@ -872,6 +923,89 @@ export default function Home() {
     setShareCardUrl("");
   }
 
+  function createContact() {
+    const name = newContactName.trim();
+    if (name.length < 2) return;
+    const result = addContact(memory, name);
+    setMemory(result.memory);
+    const canSelect = !fixedDateSize || selectedContactIds.length < fixedDateSize - 1;
+    if (canSelect) {
+      setSelectedContactIds((ids) => ids.includes(result.contactId) ? ids : [...ids, result.contactId]);
+      if (!fixedDateSize) setSize((current) => Math.max(current, Math.min(20, selectedContactIds.length + 2)));
+    }
+    setNewContactName("");
+  }
+
+  function toggleContact(contactId: string) {
+    setSelectedContactIds((ids) => {
+      if (!ids.includes(contactId) && fixedDateSize && ids.length >= fixedDateSize - 1) return ids;
+      const next = ids.includes(contactId) ? ids.filter((id) => id !== contactId) : [...ids, contactId];
+      if (!ids.includes(contactId)) setSize((current) => Math.max(current, Math.min(20, next.length + 1)));
+      return next;
+    });
+  }
+
+  function toggleFavoritePlace(stop: VenueStop) {
+    const id = stopMemoryId(stop);
+    const exists = memory.favoritePlaces.some((place) => place.id === id);
+    setMemory((current) => ({
+      ...current,
+      favoritePlaces: exists ? current.favoritePlaces.filter((place) => place.id !== id) : [...current.favoritePlaces, { id, name: stop.name, address: stop.address, city: activeCity.name, tags: stop.tags ?? [], savedAt: new Date().toISOString() }],
+      preferenceWeights: updateWeights(current.preferenceWeights, stop.tags ?? [], exists ? -.25 : .25),
+    }));
+  }
+
+  function saveCurrentRoute() {
+    const id = `${selectedPlan}:${displayStops.map(stopMemoryId).join("|")}`;
+    setMemory((current) => ({ ...current, savedRoutes: current.savedRoutes.some((route) => route.id === id) ? current.savedRoutes.filter((route) => route.id !== id) : [...current.savedRoutes, { id, title: currentPlanTitle, city: activeCity.name, stopNames: displayStops.map((stop) => stop.name), savedAt: new Date().toISOString() }] }));
+  }
+
+  function saveCurrentMeeting() {
+    const id = meetingId || `draft:${normalizeSearch(meetingName)}`;
+    setMemory((current) => ({ ...current, savedMeetings: current.savedMeetings.some((meeting) => meeting.id === id) ? current.savedMeetings.filter((meeting) => meeting.id !== id) : [...current.savedMeetings, { id, name: meetingName, city: activeCity.name, savedAt: new Date().toISOString() }] }));
+  }
+
+  function moveRouteStop(index: number, direction: -1 | 1) {
+    const target = index + direction;
+    if (target < 0 || target >= editableStops.length) return;
+    const next = [...editableStops];
+    [next[index], next[target]] = [next[target], next[index]];
+    const times = editableStops.map((stop) => stop.time);
+    setRouteLayouts((current) => ({ ...current, [selectedPlan]: next.map((stop, stopIndex) => ({ ...stop, time: times[stopIndex] })) }));
+    setShareCardUrl("");
+  }
+
+  function removeRouteStop(index: number) {
+    if (editableStops.length <= 2) return;
+    setRouteLayouts((current) => ({ ...current, [selectedPlan]: editableStops.filter((_, stopIndex) => stopIndex !== index) }));
+    setSelectedVenue("");
+    setShareCardUrl("");
+  }
+
+  function rebuildRoute(intent: typeof rebuildIntent) {
+    setRebuildIntent(intent);
+    setRouteLayouts((current) => Object.fromEntries(Object.entries(current).filter(([planId]) => planId !== selectedPlan)));
+    setStopAlternativeSelections({});
+    setFeedbackSaved(false);
+    window.requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: "smooth" }));
+  }
+
+  function saveFeedback() {
+    if (feedbackRating < 1) return;
+    const routeTags = Array.from(new Set(displayStops.flatMap((stop) => stop.tags ?? [])));
+    let weights = updateWeights(memory.preferenceWeights, routeTags, (feedbackRating - 3) * .04);
+    displayStops.forEach((stop) => {
+      const reaction = placeReactions[stopMemoryId(stop)];
+      const delta = reaction === "love" ? .2 : reaction === "like" ? .1 : reaction === "dislike" ? -.2 : 0;
+      if (delta) weights = updateWeights(weights, stop.tags ?? [], delta);
+    });
+    if (feedbackIssues.includes("too-far")) weights = updateWeights(weights, ["walking"], -.15);
+    if (feedbackPositives.includes("distance")) weights = updateWeights(weights, ["walking"], .1);
+    const feedback = { id: `feedback-${Date.now().toString(36)}`, meetingId: meetingId || "draft", routeId: selectedPlan, rating: feedbackRating, positives: feedbackPositives, issues: feedbackIssues, placeReactions, createdAt: new Date().toISOString() };
+    setMemory((current) => ({ ...current, preferenceWeights: weights, feedback: [...current.feedback, feedback], visitedPlaceIds: Array.from(new Set([...current.visitedPlaceIds, ...displayStops.map(stopMemoryId)])) }));
+    setFeedbackSaved(true);
+  }
+
   const selectLocationCandidate = useCallback((id: string) => {
     const candidate = visiblePlaces.find((item) => item.id === id);
     if (!candidate) return;
@@ -987,13 +1121,15 @@ export default function Home() {
 
   async function finishMeeting() {
     const id = meetingId || `SPB-${Date.now().toString(36).slice(-6).toUpperCase()}`;
-    const meetingParticipants = participants.length === size ? participants : makeParticipants(size);
-    const snapshot = { goal, company, size, selectedDates, availability, budgetLimit, budgetUnlimited, budgetScope, city, district, meetingPoint: meetingCenter, prefs, meetingName, selectedPlan, participants: meetingParticipants };
+    const contactNames = selectedContacts.map((contact) => contact.name);
+    const meetingParticipants = participants.length === size ? participants : makeParticipants(size, contactNames);
+    const snapshot = { goal, company, size, selectedDates, availability, budgetLimit, budgetUnlimited, budgetScope, city, district, meetingPoint: meetingCenter, prefs, meetingName, selectedPlan, participants: meetingParticipants, invitedContactIds: selectedContactIds };
     const meeting = { id, name: meetingName.trim(), status: "collecting", snapshot, updatedAt: new Date().toISOString() };
     setParticipants(meetingParticipants);
     setMeetingId(id);
     setSaveState("saving");
     setMode("room");
+    if (selectedContactIds.length) setMemory((current) => ({ ...current, contacts: current.contacts.map((contact) => selectedContactIds.includes(contact.id) ? { ...contact, meetingsCount: contact.meetingsCount + 1 } : contact) }));
 
     try {
       const existing = JSON.parse(window.localStorage.getItem("soberu-meetings") || "[]") as Array<{ id?: string }>;
@@ -1011,7 +1147,7 @@ export default function Home() {
     setMode("builder"); setStep(1); setGoal("talk"); setCompany("Друзья"); setSize(4);
     setSelectedDates(getInitialDates()); setAvailability(getInitialAvailability()); setDateDraft("");
     setBudgetLimit(2500); setBudgetUnlimited(false); setBudgetScope("person"); setCity("moscow"); setDistrict(cityConfigs.moscow.defaultDistrict);
-    setLocationView("map"); setPlaceQuery(""); setRemotePlaceResults([]); setPlaceSearchState("idle"); setSearchOpen(false); setCustomMeetingPoint(null); setPendingMeetingPoint(null); setMeetingPointConfirmed(false); setSelectedVenue(""); setShareCardUrl(""); setShareCardLoading(false); setMeetingId(""); setSaveState("idle"); setPrefs(["Прогулка", "Новая кухня"]); setPreferenceQuery(""); setMeetingName("Августовский вечер"); setParticipants([]); setStopAlternativeSelections({});
+    setLocationView("map"); setPlaceQuery(""); setRemotePlaceResults([]); setPlaceSearchState("idle"); setSearchOpen(false); setCustomMeetingPoint(null); setPendingMeetingPoint(null); setMeetingPointConfirmed(false); setSelectedVenue(""); setShareCardUrl(""); setShareCardLoading(false); setMeetingId(""); setSaveState("idle"); setPrefs(["Прогулка", "Новая кухня"]); setPreferenceQuery(""); setMeetingName("Августовский вечер"); setParticipants([]); setStopAlternativeSelections({}); setSelectedContactIds([]); setRouteLayouts({}); setRebuildIntent(""); setFeedbackRating(0); setFeedbackPositives([]); setFeedbackIssues([]); setPlaceReactions({}); setFeedbackSaved(false);
   }
 
   if (guestStage !== "idle") {
@@ -1033,7 +1169,7 @@ export default function Home() {
           <span className="brand-mark"><i />S</span><span>Soberu</span><small>beta</small>
         </button>
         <div className="city-switch" aria-label="Город встречи"><span className="city-switch-label"><i />Город встречи</span><div>{(["moscow", "spb"] as CityId[]).map((item) => <button key={item} type="button" className={city === item ? "active" : ""} onClick={() => chooseCity(item)}><span>{item === "moscow" ? "МСК" : "СПБ"}</span>{cityConfigs[item].shortName}</button>)}</div></div>
-        <button className="quiet-button" onClick={resetMeeting} type="button">+ Новая встреча</button>
+        <div className="top-actions"><button className="memory-button" onClick={() => setMemoryOpen(true)} type="button">♡ Моё <span>{memory.favoritePlaces.length + memory.savedRoutes.length}</span></button><button className="quiet-button" onClick={resetMeeting} type="button">+ Новая встреча</button></div>
       </header>
 
       {mode === "builder" && (
@@ -1085,6 +1221,7 @@ export default function Home() {
                 <div className="planner-heading"><div><p>Состав компании</p><h2>Кто будет?</h2></div><span className="sun-mark">⌁</span></div>
                 <div className="field-group"><span className="field-label">Вы встречаетесь как</span><div className="choice-row">{companies.map((item) => <button className={company === item ? "choice active" : "choice"} onClick={() => chooseCompany(item)} type="button" key={item}>{item}</button>)}</div></div>
                 <div className="field-group"><span className="field-label">Сколько вас будет</span><div className={`people-range-box ${fixedDateSize ? "locked" : ""}`}><div className="people-range-head"><span><small>Размер компании</small><strong>{sizeLabel} {sizeWord}</strong></span><b>{company === "Свидание" ? "Свидание — всегда вдвоём" : company === "Парное свидание" ? "Две пары — четыре человека" : size <= 5 ? "Небольшая компания" : size <= 10 ? "Можно одним столом" : "Большая компания"}</b></div><input aria-label="Количество участников" type="range" min="2" max="20" step="1" value={size} disabled={Boolean(fixedDateSize)} style={{ background: `linear-gradient(90deg, var(--violet) 0%, var(--lime) ${peopleProgress}%, rgba(255,255,255,.08) ${peopleProgress}%, rgba(255,255,255,.08) 100%)` }} onChange={(event) => setSize(Number(event.target.value))} /><div className="people-range-foot"><span>2</span><small>{fixedDateSize ? "количество зафиксировано форматом" : "проведите ползунок"}</small><span>20+</span></div></div></div>
+                <div className="contacts-picker"><div><span className="field-label">Контакты Soberu</span><small>Выберите знакомых — их имена сразу займут места в комнате. Ссылка для остальных останется.</small></div>{memory.contacts.length > 0 && <div className="contact-chips">{memory.contacts.map((contact) => <button type="button" className={selectedContactIds.includes(contact.id) ? "active" : ""} onClick={() => toggleContact(contact.id)} key={contact.id}><span>{contact.name.slice(0, 1).toUpperCase()}</span><b>{contact.name}</b><small>{contact.meetingsCount ? `${contact.meetingsCount} встр.` : "новый"}</small></button>)}</div>}<div className="contact-adder"><input value={newContactName} onChange={(event) => setNewContactName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") createContact(); }} placeholder="Имя нового контакта" aria-label="Имя нового контакта" maxLength={28} /><button type="button" onClick={createContact} disabled={newContactName.trim().length < 2}>Добавить +</button></div></div>
                 <div className="notice"><span>i</span><p><strong>Участники смогут уточнить это сами.</strong><br />По ссылке мы спросим про детей, алкоголь, доступность и сколько можно ходить.</p></div>
               </div>
             )}
@@ -1217,7 +1354,7 @@ export default function Home() {
                 <span className={`plan-number ${plan.color}`}>{plan.number}</span><span className="plan-main"><small className="plan-badge">{plan.badge}</small><strong>{planTitle(plan)}</strong><em>{plan.subtitle}</em></span>
                 <span className="plan-meta"><small>≈ {planDistances[plan.id].toFixed(1)} км весь маршрут</small><strong>{plan.price}</strong></span><span className="plan-score"><strong>{plan.score}</strong><small>совпадение</small></span><span className="radio-dot" />
               </button>
-              {selectedPlan === plan.id && <div className="plan-details"><p><span>Почему подходит</span>{plan.reason}</p><ol>{plan.steps.map((item) => <li key={item}>{item}</li>)}</ol></div>}
+              {selectedPlan === plan.id && <div className="plan-details"><p><span>Почему подходит</span>{plan.reason}</p><div className="match-reasons">{routeReasons.map((reason) => <span key={reason}>✓ {reason}</span>)}</div><ol>{plan.steps.map((item) => <li key={item}>{item}</li>)}</ol></div>}
             </article>
           ))}</div>
           <div className="plan-action"><p>{finalStops.length === 0 ? "Для этой точки пока не нашлось компактного маршрута. Вернитесь к условиям и выберите соседний район или точку на карте." : hasDayProgram ? "Остановки уже выстроены от места встречи без возвратов и кругов. Этап можно пропустить, не ломая всю программу." : "На карте показан только общий маршрут прогулки — без поездок каждого участника до места встречи."}</p><button className="primary-button" disabled={finalStops.length === 0} onClick={() => { setSelectedVenue(finalStops[0]?.id || ""); setMode("final"); }} type="button">{hasDayProgram ? "Выбрать программу" : "Выбрать этот план"} <b>→</b></button></div>
@@ -1229,16 +1366,21 @@ export default function Home() {
           <div className="final-confetti">✦</div><p className="eyebrow">Решено!</p><h1>{currentPlanTitle}</h1><p className="room-lede">{formatDate(hasDayProgram ? longestWindow.date : firstMeetingDate, "long")} · {hasDayProgram ? timeWindowLabel : "встречаемся в 18:30"}</p>
           <div className="final-map-block"><SoberuMap cityName={activeCity.name} cityCenter={activeCity.center} cityBounds={activeCity.bounds} meetingPoint={meetingCenter} stops={displayStops} showRoute activeStopId={selectedVenue || displayStops[0]?.id} onStopSelect={setSelectedVenue} height="large" /></div>
           <div className="final-card"><div className="final-card-head"><span className={`plan-number ${currentPlan.color}`}>{currentPlan.number}</span><div><small>{meetingName}</small><strong>{currentPlan.subtitle}</strong></div><span className="confirmed-pill">План выбран ✓</span></div>
-            <div className="route-list interactive">{finalStops.map((sourceStop, index) => { const stop = displayStops[index] ?? sourceStop; const selection = stopAlternativeSelections[`${selectedPlan}:${sourceStop.id}`] ?? 0; return <div className={selectedVenue === sourceStop.id ? "route-stop selected" : "route-stop"} key={sourceStop.id}>
+            <div className="route-editor"><div><small>Хозяин маршрута — вы</small><strong>Пересобрать программу</strong></div><div>{([['compact','Меньше ходить'],['budget','Дешевле'],['food','Больше еды'],['calm','Спокойнее'],['novelty','Необычнее']] as const).map(([intent,label]) => <button type="button" className={rebuildIntent === intent ? "active" : ""} onClick={() => rebuildRoute(intent)} key={intent}>{label}</button>)}</div></div>
+            <div className="route-list interactive">{editableStops.map((sourceStop, index) => { const stop = displayStops[index] ?? sourceStop; const selection = stopAlternativeSelections[`${selectedPlan}:${sourceStop.id}`] ?? 0; const favorite = memory.favoritePlaces.some((place) => place.id === stopMemoryId(stop)); return <div className={selectedVenue === sourceStop.id ? "route-stop selected" : "route-stop"} key={sourceStop.id}>
               <button className="route-stop-main" type="button" onClick={() => setSelectedVenue(sourceStop.id)} aria-label={`Показать на карте ${stop.name}`}><span>{stop.time}</span><i>{index + 1}</i><p><strong>{stop.name}</strong><small>{stop.address} · {stop.note}</small></p><b>Изменить ↗</b></button>
+              <div className="route-edit-actions"><button className={favorite ? "favorite" : ""} type="button" onClick={() => toggleFavoritePlace(stop)} aria-label={favorite ? `Убрать ${stop.name} из избранного` : `Добавить ${stop.name} в избранное`}>{favorite ? "♥" : "♡"}</button><button type="button" onClick={() => moveRouteStop(index, -1)} disabled={index === 0} aria-label="Переместить выше">↑</button><button type="button" onClick={() => moveRouteStop(index, 1)} disabled={index === editableStops.length - 1} aria-label="Переместить ниже">↓</button><button type="button" onClick={() => removeRouteStop(index)} disabled={editableStops.length <= 2} aria-label="Удалить точку">×</button></div>
               {selectedVenue === sourceStop.id && <div className="venue-more venue-switcher"><div><span>Выберите точку маршрута</span><button className={selection === 0 ? "active" : ""} type="button" onClick={() => chooseStopAlternative(sourceStop, 0)}><strong>{sourceStop.name}</strong><small>Основной вариант</small></button>{sourceStop.analogs.map((analog, analogIndex) => <button className={selection === analogIndex + 1 ? "active" : ""} type="button" disabled={!analog.coords} onClick={() => chooseStopAlternative(sourceStop, analogIndex + 1)} key={`${sourceStop.id}:${analog.name}`}><strong>{analog.name}</strong><small>{analog.distance}</small></button>)}</div><a className="venue-site resource-link" href={stop.website} target="_blank" rel="noreferrer"><span aria-hidden="true">◎</span><em>Ресурс</em></a></div>}
             </div>; })}</div>
+            <div className="save-strip"><button className={currentRouteSaved ? "active" : ""} type="button" onClick={saveCurrentRoute}>{currentRouteSaved ? "♥ Маршрут сохранён" : "♡ Сохранить маршрут"}</button><button className={currentMeetingSaved ? "active" : ""} type="button" onClick={saveCurrentMeeting}>{currentMeetingSaved ? "♥ Встреча сохранена" : "♡ Сохранить встречу"}</button></div>
             <div className="final-bottom"><span><small>Ориентир по бюджету</small><strong>{currentPlan.price}</strong></span><button onClick={createShareCard} disabled={shareCardLoading} type="button">{shareCardLoading ? `Рисуем карту ${activeCity.shortName}…` : "Поделиться красивой карточкой ↗"}</button></div>
           </div>
+          <section className="feedback-card"><div className="feedback-head"><div><small>После встречи</small><h2>{feedbackSaved ? "Спасибо — следующая подборка станет точнее" : "Ну как вам маршрут?"}</h2></div><div className="rating-row" aria-label="Оценка маршрута">{[1,2,3,4,5].map((rating) => <button type="button" className={feedbackRating >= rating ? "active" : ""} onClick={() => { setFeedbackRating(rating); setFeedbackSaved(false); }} aria-label={`${rating} из 5`} key={rating}>★</button>)}</div></div>{!feedbackSaved && <><div className="feedback-columns"><div><span>Что понравилось?</span>{[['places','Места'],['sequence','Последовательность'],['distance','Расстояния'],['atmosphere','Атмосфера'],['price','Цена']].map(([id,label]) => <button type="button" className={feedbackPositives.includes(id) ? "active" : ""} onClick={() => toggleFromList(id, feedbackPositives, setFeedbackPositives)} key={id}>✓ {label}</button>)}</div><div><span>Что было не очень?</span>{[['too-far','Слишком далеко'],['too-expensive','Слишком дорого'],['too-many','Слишком много мест'],['bad-place','Место не понравилось']].map(([id,label]) => <button type="button" className={feedbackIssues.includes(id) ? "active issue" : ""} onClick={() => toggleFromList(id, feedbackIssues, setFeedbackIssues)} key={id}>{label}</button>)}</div></div><div className="place-feedback"><span>Отдельные места</span>{displayStops.map((stop) => <div key={stopMemoryId(stop)}><p><strong>{stop.name}</strong><small>{stop.address}</small></p><div>{([['love','♥'],['like','👍'],['neutral','•'],['dislike','−']] as const).map(([reaction,icon]) => <button type="button" className={placeReactions[stopMemoryId(stop)] === reaction ? "active" : ""} onClick={() => setPlaceReactions((current) => ({ ...current, [stopMemoryId(stop)]: reaction }))} aria-label={`${reaction}: ${stop.name}`} key={reaction}>{icon}</button>)}</div></div>)}</div><button className="primary-button feedback-submit" type="button" disabled={feedbackRating < 1} onClick={saveFeedback}>Сохранить отзыв <b>→</b></button></>}</section>
           <section className="rejected-plans"><div><small>Остались в подборке</small><h2>Другие варианты</h2><p>Нажмите «Сравнить» — финальная программа сразу заменится выбранной.</p></div><div>{availablePlans.filter((plan) => plan.id !== selectedPlan).map((plan) => <article key={plan.id}><span className={`plan-number ${plan.color}`}>{plan.number}</span><p><small>{plan.badge}</small><strong>{planTitle(plan)}</strong><em>{plan.subtitle} · ≈ {planDistances[plan.id].toFixed(1)} км весь маршрут</em></p><div><strong>{plan.score}</strong><small>{plan.price}</small></div><button type="button" onClick={() => choosePlan(plan.id, true)}>Сравнить ↗</button></article>)}</div></section>
           <div className="final-actions"><button className="back-button" onClick={() => setMode("plans")} type="button">← Вернуться к планам</button><button className="quiet-button" onClick={resetMeeting} type="button">Создать ещё одну встречу</button></div>
         </section>
       )}
+      {memoryOpen && <div className="memory-overlay" role="dialog" aria-modal="true" aria-label="Моё в Soberu"><aside className="memory-panel"><div className="memory-panel-head"><div><small>Soberu memory</small><h2>Ваши люди и места</h2></div><button type="button" onClick={() => setMemoryOpen(false)} aria-label="Закрыть">×</button></div><label className="memory-profile"><span>{memory.profile.name.slice(0,1).toUpperCase()}</span><p><small>Как вас называть</small><input value={memory.profile.name} onChange={(event) => setMemory((current) => ({ ...current, profile: { ...current.profile, name: event.target.value } }))} maxLength={28} /></p></label><div className="memory-stats"><span><strong>{memory.contacts.length}</strong><small>контактов</small></span><span><strong>{memory.favoritePlaces.length}</strong><small>мест</small></span><span><strong>{memory.savedRoutes.length}</strong><small>маршрутов</small></span><span><strong>{memory.feedback.length}</strong><small>оценок</small></span></div><section><div className="memory-section-title"><strong>Контакты</strong><small>Выбираются на шаге «Кто будет?»</small></div>{memory.contacts.length ? <div className="memory-list">{memory.contacts.map((contact) => <div key={contact.id}><span>{contact.name.slice(0,1).toUpperCase()}</span><p><strong>{contact.name}</strong><small>{contact.meetingsCount} совместных встреч</small></p></div>)}</div> : <p className="memory-empty">Добавьте первый контакт при создании встречи.</p>}</section><section><div className="memory-section-title"><strong>Избранные места</strong><small>Уже влияют на новые рекомендации</small></div>{memory.favoritePlaces.length ? <div className="memory-list places">{memory.favoritePlaces.slice(-8).reverse().map((place) => <div key={place.id}><span>♥</span><p><strong>{place.name}</strong><small>{place.address}</small></p></div>)}</div> : <p className="memory-empty">Нажмите ♡ рядом с точкой готового маршрута.</p>}</section><section><div className="memory-section-title"><strong>Сохранённые маршруты</strong><small>{memory.savedMeetings.length} сохранённых встреч</small></div>{memory.savedRoutes.length ? <div className="memory-list places">{memory.savedRoutes.slice(-5).reverse().map((route) => <div key={route.id}><span>↗</span><p><strong>{route.title}</strong><small>{route.stopNames.join(" → ")}</small></p></div>)}</div> : <p className="memory-empty">Здесь появятся удачные программы вечера.</p>}</section><p className="memory-privacy">Пока профиль хранится только на этом устройстве. Это честная основа до появления авторизации; ссылки на встречи и гостевые ответы продолжают работать через Cloudflare D1.</p></aside></div>}
       {shareCardUrl && <div className="share-card-modal" role="dialog" aria-modal="true" aria-label="Карточка маршрута"><button className="share-modal-close" type="button" onClick={() => setShareCardUrl("")} aria-label="Закрыть">×</button><div><p>Карточка готова</p><h2>Можно отправить друзьям</h2><img src={shareCardUrl} alt={`Маршрут ${currentPlanTitle}`} /><div><button className="back-button" type="button" onClick={() => setShareCardUrl("")}>Назад</button><button className="primary-button" type="button" onClick={shareGeneratedCard}>Поделиться / скачать <b>↗</b></button></div></div></div>}
     </main>
   );
