@@ -20,9 +20,14 @@ export const catalogPlaces = sqliteTable("catalog_places", {
   address: text("address"),
   subway: text("subway"),
   district: text("district"),
+  city: text("city").notNull().default("spb"),
   lat: real("lat").notNull(),
   lon: real("lon").notNull(),
   categories: text("categories", { mode: "json" }).$type<string[]>().notNull().default([]),
+  traits: text("traits", { mode: "json" }).$type<string[]>().notNull().default([]),
+  canonicalKey: text("canonical_key").notNull().default(""),
+  popularity: integer("popularity").notNull().default(0),
+  qualityScore: real("quality_score").notNull().default(0),
   website: text("website"),
   imageUrl: text("image_url"),
   isClosed: integer("is_closed", { mode: "boolean" }).notNull().default(false),
@@ -31,6 +36,9 @@ export const catalogPlaces = sqliteTable("catalog_places", {
 }, (table) => [
   uniqueIndex("catalog_places_source_id_uq").on(table.source, table.sourceId),
   index("catalog_places_geo_idx").on(table.lat, table.lon),
+  index("catalog_places_city_geo_idx").on(table.city, table.lat, table.lon),
+  index("catalog_places_city_quality_idx").on(table.city, table.qualityScore),
+  index("catalog_places_canonical_idx").on(table.canonicalKey),
   index("catalog_places_district_idx").on(table.district),
 ]);
 

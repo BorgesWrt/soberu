@@ -19,6 +19,7 @@ export type SavedRoute = {
   title: string;
   city: string;
   stopNames: string[];
+  stopIds?: string[];
   savedAt: string;
 };
 
@@ -26,7 +27,23 @@ export type SavedMeeting = {
   id: string;
   name: string;
   city: string;
+  goal?: string;
+  people?: number;
   savedAt: string;
+};
+
+export type MeetingTemplate = {
+  id: string;
+  name: string;
+  city: "moscow" | "spb";
+  goal: string;
+  company: string;
+  size: number;
+  prefs: string[];
+  signals: MeetingSignals;
+  budgetLimit: number;
+  budgetScope: "person" | "group";
+  createdAt: string;
 };
 
 export type PlaceReaction = "love" | "like" | "neutral" | "dislike";
@@ -43,7 +60,7 @@ export type RouteFeedback = {
 };
 
 export type SoberuMemory = {
-  version: 1;
+  version: 2;
   profile: { id: string; name: string };
   contacts: Contact[];
   favoritePlaces: FavoritePlace[];
@@ -52,6 +69,7 @@ export type SoberuMemory = {
   visitedPlaceIds: string[];
   preferenceWeights: Record<string, number>;
   feedback: RouteFeedback[];
+  templates: MeetingTemplate[];
 };
 
 export const MEMORY_STORAGE_KEY = "soberu-memory-v1";
@@ -62,7 +80,7 @@ function createId(prefix: string) {
 
 export function createDefaultMemory(): SoberuMemory {
   return {
-    version: 1,
+    version: 2,
     profile: { id: createId("profile"), name: "Вы" },
     contacts: [],
     favoritePlaces: [],
@@ -71,6 +89,7 @@ export function createDefaultMemory(): SoberuMemory {
     visitedPlaceIds: [],
     preferenceWeights: {},
     feedback: [],
+    templates: [],
   };
 }
 
@@ -78,11 +97,13 @@ export function readMemory(raw: string | null): SoberuMemory {
   const fallback = createDefaultMemory();
   if (!raw) return fallback;
   try {
-    const value = JSON.parse(raw) as Partial<SoberuMemory>;
-    if (value.version !== 1) return fallback;
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const value = parsed as Partial<SoberuMemory>;
+    if (parsed.version !== 1 && parsed.version !== 2) return fallback;
     return {
       ...fallback,
       ...value,
+      version: 2,
       profile: { ...fallback.profile, ...(value.profile ?? {}) },
       contacts: Array.isArray(value.contacts) ? value.contacts : [],
       favoritePlaces: Array.isArray(value.favoritePlaces) ? value.favoritePlaces : [],
@@ -91,6 +112,7 @@ export function readMemory(raw: string | null): SoberuMemory {
       visitedPlaceIds: Array.isArray(value.visitedPlaceIds) ? value.visitedPlaceIds : [],
       preferenceWeights: value.preferenceWeights && typeof value.preferenceWeights === "object" ? value.preferenceWeights : {},
       feedback: Array.isArray(value.feedback) ? value.feedback : [],
+      templates: Array.isArray(value.templates) ? value.templates : [],
     };
   } catch {
     return fallback;
@@ -118,3 +140,4 @@ export function updateWeights(weights: Record<string, number>, tags: string[], d
 export function preferenceBoost(weights: Record<string, number>, tags: string[]) {
   return tags.reduce((total, tag) => total + (weights[tag] ?? 0), 0);
 }
+import type { MeetingSignals } from "./recommendation";
